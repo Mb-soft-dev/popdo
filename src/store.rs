@@ -7,6 +7,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Todo {
     pub text: String,
+    /// `default` lets files saved before this field existed still load.
+    #[serde(default)]
+    pub done: bool,
+}
+
+impl Todo {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            done: false,
+        }
+    }
 }
 
 /// Where the todos live. Set `POPDO_FILE` to use another file.
@@ -56,18 +68,22 @@ mod tests {
     fn saved_todos_load_back_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new-dir").join("todos.json");
-        let todos = vec![
-            Todo {
-                text: "Préparer la réunion de l'équipe".to_string(),
-            },
-            Todo {
-                text: "Buy milk".to_string(),
-            },
-        ];
+        let mut done = Todo::new("Buy milk");
+        done.done = true;
+        let todos = vec![Todo::new("Préparer la réunion de l'équipe"), done];
 
         save(&path, &todos).unwrap();
 
         assert_eq!(load(&path).unwrap(), todos);
+    }
+
+    #[test]
+    fn files_without_done_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("todos.json");
+        fs::write(&path, r#"[{ "text": "old todo" }]"#).unwrap();
+
+        assert_eq!(load(&path).unwrap(), vec![Todo::new("old todo")]);
     }
 
     #[test]

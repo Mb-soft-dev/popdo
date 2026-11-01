@@ -3,12 +3,15 @@
 A tiny todo list for tmux popups. Press `Ctrl-T` in tmux to see your todos, then press it again to close the popup.
 
 ```
-┌ Todo (2) ─────────────────────────────────┐
-│• Préparer la réunion de lundi             │
-│• Fix the accent bug in protodo            │
-│                                           │
-└ q: close ─────────────────────────────────┘
+╭ Todo ──────────────────────────── 1/3 done ╮
+│ ○ Préparer la réunion de lundi             │
+│▌✓ Buy bread                                │
+│ ○ Écrire le README avec des exemples       │
+╰────────────────────────────────────────────╯
+ a add  e edit  space done  d delete  j/k move  q close
 ```
+
+Colors follow the Tokyo Night theme.
 
 ## Install
 
@@ -25,9 +28,22 @@ bind -n C-t display-popup -E -B -w 60% -h 50% popdo
 ## Usage
 
 ```bash
-popdo add buy milk   # add a todo (quotes are optional)
-popdo                # show the list; q, Esc or Ctrl-T closes it
+popdo                # open the list
+popdo add buy milk   # add a todo from the shell (quotes are optional)
 ```
+
+In the list:
+
+| Key | Action |
+|---|---|
+| `a` | add a todo |
+| `e` | edit the selected todo |
+| `space` | mark as done / not done |
+| `d`, then `y` | delete the selected todo |
+| `j` / `k` or arrows | move |
+| `q`, `Esc` or `Ctrl-T` | close |
+
+When typing, `Enter` saves and `Esc` cancels. Every change is saved right away.
 
 Todos are saved as JSON in your local data folder
 (`~/Library/Application Support/popdo/todos.json` on macOS).

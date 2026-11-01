@@ -1,3 +1,4 @@
+mod app;
 mod store;
 mod ui;
 
@@ -6,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use app::App;
 use store::Todo;
 
 /// A tiny todo list made for tmux popups.
@@ -41,7 +43,7 @@ fn run(cli: Cli) -> io::Result<()> {
     let mut todos = store::load(&path)?;
 
     match cli.command {
-        None => ui::show(&todos),
+        None => ui::show(App::new(path, todos)),
         Some(Command::Add { words }) => {
             let text = words.join(" ").trim().to_string();
             if text.is_empty() {
@@ -50,7 +52,7 @@ fn run(cli: Cli) -> io::Result<()> {
                     "a todo can't be empty",
                 ));
             }
-            todos.push(Todo { text: text.clone() });
+            todos.push(Todo::new(&text));
             store::save(&path, &todos)?;
             println!("Added: {text}");
             Ok(())
