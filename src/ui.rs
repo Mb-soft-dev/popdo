@@ -3,11 +3,12 @@ use std::io;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, HighlightSpacing, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::app::{App, Mode};
+use crate::app::{Action, App, Mode};
+use crate::project;
 
 // Tokyo Night, the same colors as the tmux theme.
 const BG: Color = Color::Rgb(0x1a, 0x1b, 0x26);
@@ -49,10 +50,12 @@ fn draw(frame: &mut Frame, app: &App, list_state: &mut ListState) {
         Mode::Add(_) | Mode::Edit(_) => 3,
         _ => 0,
     };
+    let footer = footer(app);
+    let footer_height = u16::try_from(footer.height()).unwrap_or(1);
     let [list_area, input_area, footer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(input_height),
-        Constraint::Length(1),
+        Constraint::Length(footer_height),
     ])
     .areas(frame.area());
 
@@ -62,29 +65,37 @@ fn draw(frame: &mut Frame, app: &App, list_state: &mut ListState) {
         Mode::Edit(text) => draw_input(frame, " Edit todo ", text, input_area),
         _ => {}
     }
-    frame.render_widget(footer(app), footer_area);
+    frame.render_widget(footer, footer_area);
 }
 
 fn draw_list(frame: &mut Frame, app: &App, list_state: &mut ListState, area: Rect) {
-    let progress = format!(" {}/{} done ", app.done_count(), app.todos.len());
+    let progress = format!(" {}/{} done ", app.done_count(), app.todos().len());
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(BLUE)
-        .title(Line::from(" Todo ").fg(PURPLE).bold())
+        .title(title(app))
         .title(Line::from(progress).fg(GRAY).right_aligned());
 
-    if app.todos.is_empty() {
-        let hint = Line::from(vec![
-            Span::raw(" No todos yet. Press "),
+    if app.todos().is_empty() {
+        let mut hint = vec![
+            Span::raw(" No todos here yet. Press "),
             Span::raw("a").fg(CYAN).bold(),
-            Span::raw(" to add one."),
-        ])
-        .fg(GRAY);
-        frame.render_widget(Paragraph::new(hint).block(block), area);
+            Span::raw(" to add one"),
+        ];
+        if app.project.is_some() {
+            hint.extend([
+                Span::raw(", "),
+                Span::raw("tab").fg(CYAN).bold(),
+                Span::raw(" to switch list"),
+            ]);
+        }
+        hint.push(Span::raw("."));
+        let hint = Paragraph::new(Line::from(hint).fg(GRAY)).block(block);
+        frame.render_widget(hint, area);
         return;
     }
 
-    let items = app.todos.iter().map(|todo| {
+    let items = app.todos().iter().map(|todo| {
         let line = if todo.done {
             Line::from(vec![
                 Span::raw("✓ ").fg(GREEN),
@@ -124,29 +135,69 @@ fn draw_input(frame: &mut Frame, title: &str, text: &str, area: Rect) {
     frame.set_cursor_position(Position::new(inner.x + text_width - scroll, inner.y));
 }
 
-fn footer(app: &App) -> Line<'static> {
+/// ` popdo │ global `: the list on screen is bright, the other one is gray.
+fn title(app: &App) -> Line<'static> {
+    let Some(project) = &app.project else {
+        return Line::from(" Todo ").fg(PURPLE).bold();
+    };
+    let tab = |name: String, active: bool| {
+        if active {
+            Span::raw(name).fg(PURPLE).bold()
+        } else {
+            Span::raw(name).fg(GRAY)
+        }
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        tab(project::list_name(Some(project)), !app.show_global),
+        Span::raw(" │ ").fg(GRAY),
+        tab("global".to_string(), app.show_global),
+        Span::raw(" "),
+    ])
+}
+
+fn footer(app: &App) -> Text<'static> {
     if let Some(error) = &app.error {
-        return Line::from(format!(" {error}")).fg(RED).bold();
+        return Line::from(format!(" {error}")).fg(RED).bold().into();
     }
     match &app.mode {
-        Mode::Normal => keys_help(&[
-            ("a", "add"),
-            ("e", "edit"),
-            ("space", "done"),
-            ("d", "delete"),
-            ("j/k", "move"),
-            ("q", "close"),
-        ]),
-        Mode::Add(_) | Mode::Edit(_) => keys_help(&[("enter", "save"), ("esc", "cancel")]),
-        Mode::ConfirmDelete => {
-            let text = app.selected_todo().map_or("", |todo| todo.text.as_str());
+        Mode::Normal => {
+            let mut moves = vec![("j/k", "move"), ("J/K", "reorder")];
+            if app.project.is_some() {
+                moves.push(("tab", "switch list"));
+            }
+            moves.push(("q", "close"));
+            Text::from(vec![
+                keys_help(&[
+                    ("a", "add"),
+                    ("e", "edit"),
+                    ("space", "done"),
+                    ("d", "delete"),
+                    ("D", "clear done"),
+                ]),
+                keys_help(&moves),
+            ])
+        }
+        Mode::Add(_) | Mode::Edit(_) => keys_help(&[("enter", "save"), ("esc", "cancel")]).into(),
+        Mode::Confirm(action) => {
+            let question = match action {
+                Action::DeleteSelected => {
+                    let text = app.selected_todo().map_or("", |todo| todo.text.as_str());
+                    format!(" Delete \"{text}\"? ")
+                }
+                Action::ClearDone => match app.done_count() {
+                    1 => " Delete the done todo? ".to_string(),
+                    n => format!(" Delete the {n} done todos? "),
+                },
+            };
             Line::from(vec![
-                Span::raw(format!(" Delete \"{text}\"? ")).fg(RED).bold(),
+                Span::raw(question).fg(RED).bold(),
                 Span::raw("y").fg(CYAN).bold(),
                 Span::raw(" yes  ").fg(GRAY),
                 Span::raw("any key").fg(CYAN).bold(),
                 Span::raw(" no").fg(GRAY),
             ])
+            .into()
         }
     }
 }

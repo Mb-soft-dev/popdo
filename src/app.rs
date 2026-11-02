@@ -1,10 +1,10 @@
 use std::io;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::store::{self, Todo};
+use crate::store::{self, Lists, Todo};
 
 /// What the keyboard is doing right now.
 #[derive(Debug, Default, PartialEq)]
@@ -15,12 +15,23 @@ pub enum Mode {
     Add(String),
     /// Changing the text of the selected todo.
     Edit(String),
-    /// Waiting for `y` before deleting the selected todo.
-    ConfirmDelete,
+    /// Waiting for `y` before doing something that can't be undone.
+    Confirm(Action),
+}
+
+/// Actions that ask "are you sure?" first.
+#[derive(Debug, PartialEq)]
+pub enum Action {
+    DeleteSelected,
+    ClearDone,
 }
 
 pub struct App {
-    pub todos: Vec<Todo>,
+    pub lists: Lists,
+    /// The git project popdo was opened in, if any.
+    pub project: Option<PathBuf>,
+    /// Show the global list instead of the project list.
+    pub show_global: bool,
     /// Index of the highlighted todo. Ignored when the list is empty.
     pub selected: usize,
     pub mode: Mode,
@@ -38,9 +49,11 @@ enum Input {
 }
 
 impl App {
-    pub fn new(path: PathBuf, todos: Vec<Todo>) -> Self {
+    pub fn new(path: PathBuf, lists: Lists, project: Option<PathBuf>) -> Self {
         Self {
-            todos,
+            lists,
+            project,
+            show_global: false,
             selected: 0,
             mode: Mode::Normal,
             error: None,
@@ -49,12 +62,38 @@ impl App {
         }
     }
 
+    /// The project of the list on screen, or `None` for the global list.
+    pub fn current_project(&self) -> Option<&Path> {
+        if self.show_global {
+            None
+        } else {
+            self.project.as_deref()
+        }
+    }
+
+    /// The list on screen.
+    pub fn todos(&self) -> &[Todo] {
+        self.lists.get(self.current_project())
+    }
+
+    fn todos_mut(&mut self) -> &mut Vec<Todo> {
+        // We can't call `self.current_project()` here: it would borrow all
+        // of `self` while `self.lists` is borrowed mutably. Borrowing two
+        // different fields (`project` and `lists`) at the same time is fine.
+        let project = if self.show_global {
+            None
+        } else {
+            self.project.as_deref()
+        };
+        self.lists.get_mut(project)
+    }
+
     pub fn selected_todo(&self) -> Option<&Todo> {
-        self.todos.get(self.selected)
+        self.todos().get(self.selected)
     }
 
     pub fn done_count(&self) -> usize {
-        self.todos.iter().filter(|todo| todo.done).count()
+        self.todos().iter().filter(|todo| todo.done).count()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -92,9 +131,12 @@ impl App {
                 Input::Submit(text) => self.rename_selected(&text).map(|()| Mode::Normal),
                 Input::Cancel => Ok(Mode::Normal),
             },
-            Mode::ConfirmDelete => {
+            Mode::Confirm(action) => {
                 if key.code == KeyCode::Char('y') {
-                    self.delete_selected()?;
+                    match action {
+                        Action::DeleteSelected => self.delete_selected()?,
+                        Action::ClearDone => self.clear_done()?,
+                    }
                 }
                 Ok(Mode::Normal)
             }
@@ -106,6 +148,8 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.select_previous(),
+            KeyCode::Char('J') => self.move_selected_down()?,
+            KeyCode::Char('K') => self.move_selected_up()?,
             KeyCode::Char('a') => return Ok(Mode::Add(String::new())),
             KeyCode::Char('e') => {
                 let text = self.selected_todo().map(|todo| todo.text.clone());
@@ -113,7 +157,14 @@ impl App {
             }
             KeyCode::Char(' ') => self.toggle_selected()?,
             KeyCode::Char('d') if self.selected_todo().is_some() => {
-                return Ok(Mode::ConfirmDelete);
+                return Ok(Mode::Confirm(Action::DeleteSelected));
+            }
+            KeyCode::Char('D') if self.done_count() > 0 => {
+                return Ok(Mode::Confirm(Action::ClearDone));
+            }
+            KeyCode::Tab if self.project.is_some() => {
+                self.show_global = !self.show_global;
+                self.selected = 0;
             }
             _ => {}
         }
@@ -125,24 +176,29 @@ impl App {
         if text.is_empty() {
             return Ok(());
         }
-        self.todos.push(Todo::new(text));
-        self.selected = self.todos.len() - 1;
+        self.todos_mut().push(Todo::new(text));
+        self.selected = self.todos().len() - 1;
         self.save()
     }
 
     fn rename_selected(&mut self, text: &str) -> io::Result<()> {
         let text = text.trim();
-        match self.todos.get_mut(self.selected) {
-            Some(todo) if !text.is_empty() => {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let selected = self.selected;
+        match self.todos_mut().get_mut(selected) {
+            Some(todo) => {
                 todo.text = text.to_string();
                 self.save()
             }
-            _ => Ok(()),
+            None => Ok(()),
         }
     }
 
     fn toggle_selected(&mut self) -> io::Result<()> {
-        match self.todos.get_mut(self.selected) {
+        let selected = self.selected;
+        match self.todos_mut().get_mut(selected) {
             Some(todo) => {
                 todo.done = !todo.done;
                 self.save()
@@ -152,17 +208,45 @@ impl App {
     }
 
     fn delete_selected(&mut self) -> io::Result<()> {
-        if self.selected >= self.todos.len() {
+        let selected = self.selected;
+        if selected >= self.todos().len() {
             return Ok(());
         }
-        self.todos.remove(self.selected);
-        // Keep the highlight on a todo that still exists.
-        self.selected = self.selected.min(self.todos.len().saturating_sub(1));
+        self.todos_mut().remove(selected);
+        self.keep_selection_in_list();
+        self.save()
+    }
+
+    fn clear_done(&mut self) -> io::Result<()> {
+        self.todos_mut().retain(|todo| !todo.done);
+        self.keep_selection_in_list();
+        self.save()
+    }
+
+    /// Swaps the selected todo with the one below it.
+    fn move_selected_down(&mut self) -> io::Result<()> {
+        let selected = self.selected;
+        if selected + 1 >= self.todos().len() {
+            return Ok(());
+        }
+        self.todos_mut().swap(selected, selected + 1);
+        self.selected += 1;
+        self.save()
+    }
+
+    /// Swaps the selected todo with the one above it.
+    fn move_selected_up(&mut self) -> io::Result<()> {
+        let selected = self.selected;
+        if selected == 0 || selected >= self.todos().len() {
+            return Ok(());
+        }
+        self.todos_mut().swap(selected - 1, selected);
+        self.selected -= 1;
         self.save()
     }
 
     fn select_next(&mut self) {
-        if self.selected + 1 < self.todos.len() {
+        if self.selected + 1 < self.todos().len() {
             self.selected += 1;
         }
     }
@@ -171,8 +255,14 @@ impl App {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    fn save(&self) -> io::Result<()> {
-        store::save(&self.path, &self.todos)
+    /// After a delete, moves the highlight up if it is past the end.
+    fn keep_selection_in_list(&mut self) {
+        self.selected = self.selected.min(self.todos().len().saturating_sub(1));
+    }
+
+    fn save(&mut self) -> io::Result<()> {
+        self.lists.remove_empty();
+        store::save(&self.path, &self.lists)
     }
 }
 
@@ -195,12 +285,36 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// An app with these todos, saving into a temporary folder.
-    /// Keep the `TempDir` alive: the folder is deleted when it is dropped.
+    const PROJECT: &str = "/code/popdo";
+
+    /// An app showing a global list with these todos, saving into a
+    /// temporary folder. Keep the `TempDir` alive: the folder is deleted
+    /// when it is dropped.
     fn app_with(texts: &[&str]) -> (App, TempDir) {
+        let lists = Lists {
+            global: todos(texts),
+            ..Lists::default()
+        };
+        new_app(lists, None)
+    }
+
+    /// An app opened inside the `PROJECT` git project.
+    fn app_in_project(project_texts: &[&str], global_texts: &[&str]) -> (App, TempDir) {
+        let mut lists = Lists {
+            global: todos(global_texts),
+            ..Lists::default()
+        };
+        *lists.get_mut(Some(Path::new(PROJECT))) = todos(project_texts);
+        new_app(lists, Some(PathBuf::from(PROJECT)))
+    }
+
+    fn new_app(lists: Lists, project: Option<PathBuf>) -> (App, TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let todos = texts.iter().map(|text| Todo::new(*text)).collect();
-        (App::new(dir.path().join("todos.json"), todos), dir)
+        (App::new(dir.path().join("todos.json"), lists, project), dir)
+    }
+
+    fn todos(texts: &[&str]) -> Vec<Todo> {
+        texts.iter().map(|text| Todo::new(*text)).collect()
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -213,7 +327,7 @@ mod tests {
         }
     }
 
-    fn saved(app: &App) -> Vec<Todo> {
+    fn saved(app: &App) -> Lists {
         store::load(&app.path).unwrap()
     }
 
@@ -225,13 +339,10 @@ mod tests {
         type_text(&mut app, "Acheter du pain");
         press(&mut app, KeyCode::Enter);
 
-        assert_eq!(
-            app.todos,
-            vec![Todo::new("one"), Todo::new("Acheter du pain")]
-        );
+        assert_eq!(app.todos(), todos(&["one", "Acheter du pain"]));
         assert_eq!(app.selected, 1);
         assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(saved(&app), app.todos);
+        assert_eq!(saved(&app).global, app.todos());
     }
 
     #[test]
@@ -242,7 +353,7 @@ mod tests {
         type_text(&mut app, "quit");
         press(&mut app, KeyCode::Esc);
 
-        assert!(app.todos.is_empty());
+        assert!(app.todos().is_empty());
         assert!(!app.should_quit);
     }
 
@@ -259,8 +370,8 @@ mod tests {
         type_text(&mut app, "deux");
         press(&mut app, KeyCode::Enter);
 
-        assert_eq!(app.todos[1].text, "deux");
-        assert_eq!(saved(&app), app.todos);
+        assert_eq!(app.todos()[1].text, "deux");
+        assert_eq!(saved(&app).global, app.todos());
     }
 
     #[test]
@@ -268,11 +379,11 @@ mod tests {
         let (mut app, _dir) = app_with(&["one"]);
 
         press(&mut app, KeyCode::Char(' '));
-        assert!(app.todos[0].done);
-        assert!(saved(&app)[0].done);
+        assert!(app.todos()[0].done);
+        assert!(saved(&app).global[0].done);
 
         press(&mut app, KeyCode::Char(' '));
-        assert!(!app.todos[0].done);
+        assert!(!app.todos()[0].done);
     }
 
     #[test]
@@ -281,12 +392,12 @@ mod tests {
 
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.todos.len(), 2);
+        assert_eq!(app.todos().len(), 2);
 
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('y'));
-        assert_eq!(app.todos, vec![Todo::new("two")]);
-        assert_eq!(saved(&app), app.todos);
+        assert_eq!(app.todos(), todos(&["two"]));
+        assert_eq!(saved(&app).global, app.todos());
     }
 
     #[test]
@@ -316,10 +427,10 @@ mod tests {
     }
 
     #[test]
-    fn edit_toggle_and_delete_do_nothing_on_an_empty_list() {
+    fn keys_do_nothing_on_an_empty_list() {
         let (mut app, _dir) = app_with(&[]);
 
-        for key in ['e', ' ', 'd'] {
+        for key in ['e', ' ', 'd', 'D', 'J', 'K'] {
             press(&mut app, KeyCode::Char(key));
             assert_eq!(app.mode, Mode::Normal);
         }
@@ -334,5 +445,82 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
 
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn shift_j_and_k_reorder_todos() {
+        let (mut app, _dir) = app_with(&["one", "two", "three"]);
+
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.todos(), todos(&["two", "one", "three"]));
+        assert_eq!(app.selected, 1);
+        assert_eq!(saved(&app).global, app.todos());
+
+        press(&mut app, KeyCode::Char('K'));
+        press(&mut app, KeyCode::Char('K'));
+        assert_eq!(app.todos(), todos(&["one", "two", "three"]));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn shift_d_clears_done_todos_after_y() {
+        let (mut app, _dir) = app_with(&["a", "b", "c"]);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char(' '));
+
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.mode, Mode::Confirm(Action::ClearDone));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(app.todos(), todos(&["b"]));
+        assert_eq!(app.selected, 0);
+        assert_eq!(saved(&app).global, app.todos());
+    }
+
+    #[test]
+    fn tab_switches_between_project_and_global() {
+        let (mut app, _dir) = app_in_project(&["project todo"], &["global todo"]);
+        assert_eq!(app.todos(), todos(&["project todo"]));
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.todos(), todos(&["global todo"]));
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.todos(), todos(&["project todo"]));
+    }
+
+    #[test]
+    fn tab_does_nothing_outside_a_project() {
+        let (mut app, _dir) = app_with(&["global todo"]);
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(!app.show_global);
+        assert_eq!(app.todos(), todos(&["global todo"]));
+    }
+
+    #[test]
+    fn todos_added_in_a_project_go_to_its_list() {
+        let (mut app, _dir) = app_in_project(&[], &["global todo"]);
+
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "fix CI");
+        press(&mut app, KeyCode::Enter);
+
+        let saved = saved(&app);
+        assert_eq!(saved.get(Some(Path::new(PROJECT))), todos(&["fix CI"]));
+        assert_eq!(saved.global, todos(&["global todo"]));
+    }
+
+    #[test]
+    fn empty_project_lists_are_not_saved() {
+        let (mut app, _dir) = app_in_project(&["only one"], &[]);
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(saved(&app).projects.is_empty());
     }
 }
